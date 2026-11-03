@@ -1,0 +1,1584 @@
+background.js :
+
+// background.js - v4.0 with Job Title, Company Name, Website URL support
+const DEFAULT_STATE = {
+    sites: [],
+    currentIndex: 0,
+    status: 'idle',
+    log: [],
+    userCredentials: {
+        email: '',
+        firstName: '',
+        lastName: '',
+        phone: '',
+        zipCode: '',
+        customMessage: '',
+        jobTitle: '',
+        companyName: '',
+        websiteUrl: '',
+    },
+    processingTabId: null,
+    siteTimeout: 15000,
+    enableScrolling: true,
+    processingUrl: null,
+    isPaused: false,
+};
+
+let state = { ...DEFAULT_STATE };
+let processingTimeout = null;
+let tabUpdatedListener = null;
+
+async function loadStateFromStorage() {
+    const storedState = await chrome.storage.local.get(['extensionState']);
+    if (storedState.extensionState) {
+        state = { ...state, ...storedState.extensionState };
+        if (!state.userCredentials) state.userCredentials = { ...DEFAULT_STATE.userCredentials };
+        if (state.userCredentials.jobTitle === undefined) state.userCredentials.jobTitle = '';
+        if (state.userCredentials.companyName === undefined) state.userCredentials.companyName = '';
+        if (state.userCredentials.websiteUrl === undefined) state.userCredentials.websiteUrl = '';
+        console.log('State loaded from storage.');
+    }
+}
+
+function saveStateToStorage() {
+    chrome.storage.local.set({ extensionState: state }).catch(err => console.error("Error saving state:", err));
+}
+
+function updateStateAndNotify(changes) {
+    Object.assign(state, changes);
+    saveStateToStorage();
+    chrome.runtime.sendMessage({ action: "UPDATE_UI", payload: state }).catch(() => {});
+}
+
+function addLog(message, type = 'info') {
+    state.log.unshift({ message, type, timestamp: new Date().toLocaleTimeString() });
+    if (state.log.length > 100) state.log.pop();
+    updateStateAndNotify({});
+}
+
+function closeProcessingTab() {
+    if (tabUpdatedListener) {
+        chrome.tabs.onUpdated.removeListener(tabUpdatedListener);
+        tabUpdatedListener = null;
+    }
+    if (state.processingTabId !== null) {
+        chrome.tabs.remove(state.processingTabId).catch(() => {});
+        state.processingTabId = null;
+    }
+    if (processingTimeout) {
+        clearTimeout(processingTimeout);
+        processingTimeout = null;
+    }
+    state.processingUrl = null;
+}
+
+async function processNextSite() {
+    if (state.status === 'paused') return;
+    if (state.status !== 'running') return;
+
+    if (state.currentIndex >= state.sites.length) {
+        addLog('All sites have been processed.', 'success');
+        updateStateAndNotify({ status: 'completed' });
+        closeProcessingTab();
+        return;
+    }
+
+    const url = state.sites[state.currentIndex];
+
+    if (state.processingUrl === url) {
+        console.log('URL already being processed, skipping:', url);
+        moveToNextSite();
+        return;
+    }
+
+    state.processingUrl = url;
+    addLog(`(${state.currentIndex + 1}/${state.sites.length}) Processing: ${url}`, 'info');
+    updateStateAndNotify({});
+
+    chrome.tabs.create({ url: url, active: false }, (tab) => {
+        if (!tab || !tab.id) {
+            addLog(`Error creating tab for ${url}`, 'error');
+            moveToNextSite();
+            return;
+        }
+
+        state.processingTabId = tab.id;
+
+        processingTimeout = setTimeout(() => {
+            addLog(`Timeout for ${url} after ${state.siteTimeout/1000}s, moving to next site.`, 'warning');
+            moveToNextSite();
+        }, state.siteTimeout);
+
+        tabUpdatedListener = (tabId, changeInfo, tab) => {
+            if (tabId === state.processingTabId && changeInfo.status === 'complete') {
+                chrome.tabs.onUpdated.removeListener(tabUpdatedListener);
+                tabUpdatedListener = null;
+
+                if (tab && tab.url && (tab.url.startsWith('chrome://') || tab.url.startsWith('about:'))) {
+                    addLog(`Tab showing error page: ${tab.url}`, 'error');
+                    moveToNextSite();
+                    return;
+                }
+
+                setTimeout(() => {
+                    if (state.status !== 'running') return;
+
+                    chrome.scripting.executeScript({ target: { tabId: tabId }, files: ['content.js'] }, () => {
+                        if (chrome.runtime.lastError) {
+                            addLog(`Error injecting script: ${chrome.runtime.lastError.message}`, 'error');
+                            moveToNextSite();
+                        } else {
+                            if (processingTimeout) {
+                                clearTimeout(processingTimeout);
+                                processingTimeout = setTimeout(() => {
+                                    addLog(`Form processing timeout for ${url}, moving to next site.`, 'warning');
+                                    moveToNextSite();
+                                }, 12000);
+                            }
+
+                            chrome.tabs.sendMessage(tabId, {
+                                action: "AUTOFILL_FORM",
+                                data: state.userCredentials,
+                                enableScrolling: state.enableScrolling
+                            });
+                        }
+                    });
+                }, 5000);
+            }
+        };
+
+        chrome.tabs.onUpdated.addListener(tabUpdatedListener);
+    });
+}
+
+function moveToNextSite() {
+    closeProcessingTab();
+    state.currentIndex++;
+    updateStateAndNotify({});
+    setTimeout(() => {
+        processNextSite();
+    }, 3000);
+}
+
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+    try {
+        switch (request.action) {
+            case "GET_STATE":
+                sendResponse(state);
+                break;
+            case "SAVE_CREDENTIALS":
+                state.userCredentials = { ...DEFAULT_STATE.userCredentials, ...request.data };
+                saveStateToStorage();
+                sendResponse({ success: true });
+                break;
+            case "CLEAR_STATE":
+                state = { ...DEFAULT_STATE };
+                saveStateToStorage();
+                closeProcessingTab();
+                sendResponse({ success: true });
+                break;
+            case "UPDATE_TIMEOUT":
+                if (request.timeout && request.timeout >= 5000) {
+                    state.siteTimeout = request.timeout;
+                    saveStateToStorage();
+                    sendResponse({ success: true });
+                } else {
+                    sendResponse({ success: false, error: 'Timeout must be at least 5000ms' });
+                }
+                break;
+            case "UPDATE_SCROLL_SETTING":
+                state.enableScrolling = request.enableScrolling;
+                saveStateToStorage();
+                sendResponse({ success: true });
+                break;
+            case "START_PROCESSING":
+                if (state.status === 'running' || state.status === 'paused') {
+                    sendResponse({ error: "Already processing or paused." });
+                    return;
+                }
+                state.sites = request.sites.map(url => url.startsWith('http') ? url : 'https://' + url);
+                state.userCredentials = { ...DEFAULT_STATE.userCredentials, ...request.data };
+                state.enableScrolling = request.enableScrolling !== undefined ? request.enableScrolling : state.enableScrolling;
+                state.currentIndex = 0;
+                state.processingUrl = null;
+                state.isPaused = false;
+                state.log = [];
+                addLog('Process started.', 'success');
+                updateStateAndNotify({ status: 'running' });
+                processNextSite();
+                sendResponse({ success: true });
+                break;
+            case "PAUSE_PROCESSING":
+                if (state.status === 'running') {
+                    state.isPaused = true;
+                    addLog('Process paused.', 'warning');
+                    updateStateAndNotify({ status: 'paused' });
+                    sendResponse({ success: true });
+                } else {
+                    sendResponse({ success: false, error: "Not currently running" });
+                }
+                break;
+            case "STOP_PROCESSING":
+                if (state.status !== 'idle' && state.status !== 'stopped') {
+                    addLog('Process stopped by user.', 'error');
+                    updateStateAndNotify({ status: 'stopped', currentIndex: 0, sites: [], processingUrl: null, isPaused: false });
+                    closeProcessingTab();
+                    sendResponse({ success: true });
+                } else {
+                    sendResponse({ success: false, error: "Not currently running" });
+                }
+                break;
+            case "RESUME_PROCESSING":
+                if (state.status === 'paused') {
+                    state.isPaused = false;
+                    addLog('Process resumed.', 'success');
+                    updateStateAndNotify({ status: 'running' });
+                    processNextSite();
+                    sendResponse({ success: true });
+                } else {
+                    sendResponse({ success: false, error: "Not currently paused" });
+                }
+                break;
+        }
+    } catch (e) {
+        console.error('Error handling message:', e);
+        sendResponse({ success: false, error: e.message });
+    }
+    return true;
+});
+
+loadStateFromStorage();
+
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+    try {
+        if (request.action === "SCRIPT_COMPLETE") {
+            const { status, message } = request;
+            addLog(`Result for ${sender.tab ? sender.tab.url : 'unknown'}: ${message}`, status);
+            moveToNextSite();
+        }
+    } catch (e) {
+        console.error('Error handling content script message:', e);
+    }
+});
+
+
+manifest.json :
+
+{
+  "manifest_version": 3,
+  "name": "Newsletter Auto-Fill Pro (Persistent)",
+  "version": "4.0",
+  "description": "Automatically signs up for newsletters on a list of sites with persistent state and enhanced form detection. Includes Job Title, Company, Website fields and full-name detection.",
+  "permissions": [
+    "scripting",
+    "tabs",
+    "storage"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
+
+content.js :
+
+// content.js - v4.1 FIXED - Job Title, Company, Website + Full Name logic
+(function() {
+    // --- HELPER FUNCTIONS ---
+    function dispatchInputEvents(element) {
+        if (!element) return;
+        try {
+            element.focus();
+            element.value = element.value;
+            element.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+            element.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+        } catch (e) {
+            console.error('Error dispatching events:', e);
+        }
+    }
+
+    function findField(selectors, context = document) {
+        for (const selector of selectors) {
+            try {
+                const field = context.querySelector(selector);
+                if (field) return field;
+            } catch (e) {}
+        }
+        return null;
+    }
+
+    // Only check for truly hidden honeypots — be very conservative
+    function isHiddenHoneypot(element) {
+        if (!element) return false;
+        const style = window.getComputedStyle(element);
+        // Only skip if explicitly hidden with display:none or visibility:hidden
+        if (style.display === 'none' || style.visibility === 'hidden') return true;
+        // Skip type=hidden inputs (they're not visible by design)
+        if (element.type === 'hidden') return true;
+        return false;
+    }
+
+    function detectPopup(callback) {
+        const popupSelectors = [
+            '[role="dialog"]', '[role="modal"]', '.modal', '.popup', '.overlay', '.dialog',
+            '.newsletter-popup', '.signup-popup', '.email-popup', '.modal-dialog', '.popup-dialog',
+            '[class*="modal"]', '[class*="popup"]', '[class*="overlay"]',
+            '[id*="modal"]', '[id*="popup"]', '[id*="overlay"]',
+            '.fancybox-content', '.mfp-content', '.swal2-container', '.sweetalert2-container',
+            '.tcb-popup', '.wpr-popup', '.pum-container', '.pp-popup', '.icegram-popup'
+        ];
+        let popup = null;
+        for (const selector of popupSelectors) {
+            const elements = document.querySelectorAll(selector);
+            for (const elem of elements) {
+                const style = window.getComputedStyle(elem);
+                if (style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0') {
+                    popup = elem;
+                    console.log('Found popup:', selector);
+                    break;
+                }
+            }
+            if (popup) break;
+        }
+        if (!popup) {
+            const fixedElements = document.querySelectorAll('*');
+            for (const elem of fixedElements) {
+                const style = window.getComputedStyle(elem);
+                if (style.position === 'fixed' && style.display !== 'none' &&
+                    style.visibility !== 'hidden' && style.opacity !== '0' &&
+                    elem.offsetWidth > 100 && elem.offsetHeight > 100) {
+                    const hasForm = elem.querySelector('form, input[type="email"], input[type="text"], button');
+                    if (hasForm) { popup = elem; console.log('Found fixed position popup'); break; }
+                }
+            }
+        }
+        callback(popup);
+    }
+
+    function waitForPopup(callback, maxWait = 5000) {
+        let attempts = 0;
+        const maxAttempts = maxWait / 100;
+        function check() {
+            detectPopup((popup) => {
+                if (popup) callback(popup);
+                else if (attempts < maxAttempts) { attempts++; setTimeout(check, 100); }
+                else callback(null);
+            });
+        }
+        check();
+    }
+
+    function checkConsentCheckboxes(context = document) {
+        const consentSelectors = [
+            'input[type="checkbox"][name*="consent" i]', 'input[type="checkbox"][name*="agree" i]',
+            'input[type="checkbox"][name*="accept" i]', 'input[type="checkbox"][name*="terms" i]',
+            'input[type="checkbox"][name*="privacy" i]', 'input[type="checkbox"][name*="gdpr" i]',
+            'input[type="checkbox"][id*="consent" i]', 'input[type="checkbox"][id*="agree" i]',
+            'input[type="checkbox"][id*="accept" i]', 'input[type="checkbox"][id*="terms" i]',
+            'input[type="checkbox"][id*="privacy" i]', 'input[type="checkbox"][id*="gdpr" i]',
+            'input[type="checkbox"][class*="consent" i]', 'input[type="checkbox"][class*="agree" i]',
+            'input[type="checkbox"][class*="accept" i]', 'input[type="checkbox"][class*="terms" i]',
+            'input[type="checkbox"][class*="privacy" i]', 'input[type="checkbox"][class*="gdpr" i]',
+            'input[type="checkbox"][aria-label*="consent" i]', 'input[type="checkbox"][aria-label*="agree" i]',
+            'input[type="checkbox"][aria-label*="accept" i]', 'input[type="checkbox"][aria-label*="terms" i]',
+            'input[type="checkbox"][aria-label*="privacy" i]',
+            'input[type="checkbox"][data-testid*="consent" i]', 'input[type="checkbox"][data-testid*="agree" i]',
+            'input[type="checkbox"][data-testid*="accept" i]', 'input[type="checkbox"][data-testid*="terms" i]',
+            'input[type="checkbox"][data-testid*="privacy" i]'
+        ];
+        let checkedCount = 0;
+        consentSelectors.forEach(selector => {
+            try {
+                const checkboxes = context.querySelectorAll(selector);
+                checkboxes.forEach(checkbox => {
+                    if (!checkbox.checked) {
+                        try {
+                            checkbox.checked = true;
+                            checkbox.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+                            checkbox.dispatchEvent(new Event('click', { bubbles: true, cancelable: true }));
+                            checkedCount++;
+                            console.log('Checked consent checkbox:', selector);
+                        } catch (e) { console.error('Error checking checkbox:', e); }
+                    }
+                });
+            } catch (e) {}
+        });
+        const emailField = context.querySelector('input[type="email"], input[name*="email" i], input[id*="email" i]');
+        if (emailField) {
+            const form = emailField.closest('form');
+            if (form) {
+                const allCheckboxes = form.querySelectorAll('input[type="checkbox"]');
+                allCheckboxes.forEach(checkbox => {
+                    if (!checkbox.checked) {
+                        const parent = checkbox.closest('label, div, p');
+                        if (parent) {
+                            const text = parent.textContent.toLowerCase();
+                            if (text.includes('consent') || text.includes('agree') || text.includes('accept') ||
+                                text.includes('terms') || text.includes('privacy') || text.includes('gdpr') ||
+                                text.includes('newsletter') || text.includes('subscribe') || text.includes('email')) {
+                                checkbox.checked = true;
+                                checkbox.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+                                checkbox.dispatchEvent(new Event('click', { bubbles: true, cancelable: true }));
+                                checkedCount++;
+                                console.log('Checked nearby consent checkbox');
+                            }
+                        }
+                    }
+                });
+            }
+        }
+        return checkedCount;
+    }
+
+    function findSubmitButton(form, emailField, context = document) {
+        const selectors = [
+            'button[type="submit"]', 'input[type="submit"]', 'button:not([type])',
+            'button[type="button"]', 'a[href*="submit"]', 'a[href*="subscribe"]',
+            'a[onclick*="submit"]', 'a[onclick*="subscribe"]'
+        ];
+        let buttons = [];
+        if (form) buttons = form.querySelectorAll(selectors.join(','));
+        else buttons = context.querySelectorAll(selectors.join(','));
+
+        for (const button of buttons) {
+            const text = (button.innerText || button.value || button.title || '').toLowerCase();
+            const onclick = button.getAttribute('onclick') || button.onclick;
+            const href = button.getAttribute('href') || '';
+            if (text.includes('subscribe') || text.includes('sign up') || text.includes('submit') ||
+                text.includes('go') || text.includes('register') || text.includes('join') ||
+                text.includes('get') || text.includes('send') || text.includes('continue') ||
+                onclick || href.includes('submit') || href.includes('subscribe')) {
+                const style = window.getComputedStyle(button);
+                if (style.display !== 'none' && style.visibility !== 'hidden' &&
+                    !button.disabled && !button.hasAttribute('disabled')) return button;
+            }
+        }
+        if (emailField) {
+            const parent = emailField.closest('div, form, section, li');
+            if (parent) {
+                const nearbyButtons = parent.querySelectorAll('button, input[type="button"], input[type="submit"], a[onclick], a[href]');
+                for (const btn of nearbyButtons) {
+                    if (btn !== emailField) {
+                        const style = window.getComputedStyle(btn);
+                        if (style.display !== 'none' && style.visibility !== 'hidden' &&
+                            !btn.disabled && !btn.hasAttribute('disabled')) return btn;
+                    }
+                }
+            }
+        }
+        if (form) {
+            const anyButton = form.querySelector('button:not([disabled]), input[type="submit"]:not([disabled]), input[type="button"]:not([disabled])');
+            if (anyButton) return anyButton;
+        }
+        if (form) {
+            const clickables = form.querySelectorAll('[onclick], [role="button"], .btn, .submit, [class*="button"]');
+            for (const elem of clickables) {
+                const style = window.getComputedStyle(elem);
+                if (style.display !== 'none' && style.visibility !== 'hidden' &&
+                    !elem.disabled && !elem.hasAttribute('disabled') &&
+                    (elem.onclick || elem.getAttribute('onclick') || elem.getAttribute('role') === 'button')) return elem;
+            }
+        }
+        if (emailField) {
+            const siblings = Array.from(emailField.parentElement?.children || []);
+            for (const sibling of siblings) {
+                if (sibling !== emailField && (sibling.tagName === 'BUTTON' || sibling.tagName === 'A' || sibling.tagName === 'INPUT' || sibling.onclick)) {
+                    const style = window.getComputedStyle(sibling);
+                    if (style.display !== 'none' && style.visibility !== 'hidden' &&
+                        !sibling.disabled && !sibling.hasAttribute('disabled')) return sibling;
+                }
+            }
+        }
+        return null;
+    }
+
+    function scrollToElement(element) {
+        if (!element) return;
+        try {
+            element.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'center' });
+            setTimeout(() => {
+                const rect = element.getBoundingClientRect();
+                if (rect.top < 0 || rect.bottom > window.innerHeight) {
+                    element.scrollIntoView({ behavior: 'auto', block: 'center' });
+                }
+            }, 500);
+        } catch (e) {
+            console.error('Error scrolling:', e);
+            const rect = element.getBoundingClientRect();
+            window.scrollTo({ top: rect.top + window.scrollY - window.innerHeight / 2, behavior: 'smooth' });
+        }
+    }
+
+    function checkForPopupOverlays() {
+        const overlaySelectors = [
+            '.overlay', '[class*="overlay"]', '[id*="overlay"]',
+            '.modal-backdrop', '[class*="modal-backdrop"]',
+            '.popup-overlay', '[class*="popup-overlay"]',
+            '.cookie-banner', '[class*="cookie-banner"]',
+            '[class*="gdpr-banner"]', '[class*="consent-banner"]',
+            '[class*="age-gate"]', '[class*="newsletter-popup"]'
+        ];
+        for (const selector of overlaySelectors) {
+            try {
+                const elements = document.querySelectorAll(selector);
+                for (const elem of elements) {
+                    const style = window.getComputedStyle(elem);
+                    if (style.position === 'fixed' && style.display !== 'none' &&
+                        style.zIndex > 1000 && elem.offsetWidth > 100 && elem.offsetHeight > 100) {
+                        const hasCloseButton = elem.querySelector('button, [class*="close"], [class*="dismiss"]');
+                        if (hasCloseButton) return elem;
+                    }
+                }
+            } catch (e) {}
+        }
+        return false;
+    }
+
+    function tryBypassPopupOverlays() {
+        const closeSelectors = [
+            'button[class*="close"]', 'button[class*="dismiss"]',
+            'button[class*="accept"]', 'button[class*="agree"]',
+            'button[class*="continue"]', 'a[class*="close"]',
+            'a[class*="dismiss"]', 'a[class*="accept"]', 'a[class*="continue"]',
+            '[aria-label*="close"]', '[aria-label*="dismiss"]',
+            '[aria-label*="accept"]', '[aria-label*="continue"]'
+        ];
+        for (const selector of closeSelectors) {
+            try {
+                const buttons = document.querySelectorAll(selector);
+                for (const button of buttons) {
+                    const style = window.getComputedStyle(button);
+                    if (style.display !== 'none' && style.visibility !== 'hidden' &&
+                        !button.disabled && !button.hasAttribute('disabled')) {
+                        button.click();
+                    }
+                }
+            } catch (e) {}
+        }
+        return false;
+    }
+
+    function submitForm(button, form, emailField, context = document) {
+        console.log('Attempting to submit form with button:', button);
+        const clickMethods = [
+            () => button.click(),
+            () => { const e = new MouseEvent('click', { view: window, bubbles: true, cancelable: true }); button.dispatchEvent(e); },
+            () => { const e = new TouchEvent('touchstart', { bubbles: true, cancelable: true }); button.dispatchEvent(e); },
+            () => { button.focus(); button.click(); },
+            () => { if (form && form.tagName === 'FORM') form.submit(); },
+            () => {
+                if (emailField) {
+                    emailField.focus();
+                    emailField.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+                }
+            },
+            () => {
+                if (button.onclick) { button.onclick(); }
+                else if (button.getAttribute('onclick')) { try { eval(button.getAttribute('onclick')); } catch (e) { console.error('Error executing onclick:', e); } }
+            }
+        ];
+        for (let i = 0; i < clickMethods.length; i++) {
+            try {
+                console.log(`Trying submission method ${i + 1}`);
+                clickMethods[i]();
+                setTimeout(() => {
+                    chrome.runtime.sendMessage({ action: "SCRIPT_COMPLETE", status: 'success', message: 'Form submitted successfully.' });
+                }, 2000);
+                break;
+            } catch (e) {
+                console.error(`Method ${i + 1} failed:`, e);
+                if (i === clickMethods.length - 1) {
+                    chrome.runtime.sendMessage({ action: "SCRIPT_COMPLETE", status: 'error', message: `Error submitting form: ${e.message}` });
+                }
+            }
+        }
+    }
+
+    function checkRequiredFields(form, data) {
+        const hasNameFields = form.querySelector('input[name*="first" i], input[name*="last" i], input[name*="name" i]') !== null;
+        const nameFieldsRequired = hasNameFields && (
+            form.querySelector('input[name*="first" i][required], input[name*="last" i][required], input[name*="name" i][required]') !== null ||
+            form.querySelector('input[required][name*="first" i], input[required][name*="last" i], input[required][name*="name" i]') !== null
+        );
+        console.log(`Form has name fields: ${hasNameFields}, Name fields required: ${nameFieldsRequired}`);
+        return hasNameFields && nameFieldsRequired;
+    }
+
+    // v4.1 FIXED: Full Name field detection — never overwrites email field
+    function fillNameFields(context, data, emailField) {
+        const firstNameSelectors = [
+            'input[name*="first" i], input[name*="fname" i], input[id*="first" i], input[id*="fname" i]',
+            'input[placeholder*="first" i], input[autocomplete="given-name"]',
+            'input[data-testid*="first" i], input[data-cy*="first" i]',
+            'input[name*="given" i], input[id*="given" i]'
+        ];
+        const lastNameSelectors = [
+            'input[name*="last" i], input[name*="lname" i], input[id*="last" i], input[id*="lname" i]',
+            'input[placeholder*="last" i], input[autocomplete="family-name"]',
+            'input[data-testid*="last" i], input[data-cy*="last" i]',
+            'input[name*="family" i], input[id*="family" i]'
+        ];
+        const fullNameSelectors = [
+            'input[name*="fullname" i]',
+            'input[name*="full_name" i]',
+            'input[name*="full-name" i]',
+            'input[id*="fullname" i]',
+            'input[placeholder*="full name" i]',
+            'input[autocomplete="name"]'
+        ];
+
+        const firstNameField = findField(firstNameSelectors, context);
+        const lastNameField = findField(lastNameSelectors, context);
+
+        // Priority 1: Separate first + last name fields
+        if (firstNameField && lastNameField) {
+            if (data.firstName) { firstNameField.value = data.firstName; dispatchInputEvents(firstNameField); }
+            if (data.lastName) { lastNameField.value = data.lastName; dispatchInputEvents(lastNameField); }
+            console.log('Filled separate first and last name fields');
+            return;
+        }
+
+        if (firstNameField && !lastNameField) {
+            if (data.firstName) { firstNameField.value = data.firstName; dispatchInputEvents(firstNameField); }
+            console.log('Filled first name field only');
+            return;
+        }
+
+        // Priority 2: Combined full-name field — BUT skip if it's the email field!
+        const fullNameField = findField(fullNameSelectors, context);
+        if (fullNameField && fullNameField !== emailField && !isHiddenHoneypot(fullNameField)) {
+            const fullName = (data.firstName + ' ' + data.lastName).trim();
+            if (fullName) {
+                fullNameField.value = fullName;
+                dispatchInputEvents(fullNameField);
+                console.log('Filled full name field with:', fullName);
+            }
+            return;
+        }
+
+        console.log('No name fields found, skipping name fill');
+    }
+
+    function processForm(context = document, isPopup = false) {
+        const data = window.autoFillData || {};
+        let form = context.querySelector('form');
+
+        const emailSelectors = [
+            'input[type="email"]',
+            'input[name*="email" i], input[id*="email" i], input[placeholder*="email" i], input[aria-label*="email" i]',
+            'input[data-testid*="email" i], input[data-cy*="email" i]',
+            'input[autocomplete*="email" i]',
+            'input[type="text"][name*="email" i], input[type="text"][id*="email" i]',
+            'input[autocomplete="email"]',
+            'input[placeholder*="email" i]',
+            'input[aria-label*="email" i]',
+            'input[class*="email" i]',
+            'input[name*="newsletter" i], input[id*="newsletter" i]',
+            'input[placeholder*="newsletter" i]',
+            'input[aria-label*="newsletter" i]',
+            'input[class*="newsletter" i]',
+            'input[name*="subscribe" i], input[id*="subscribe" i]',
+            'input[placeholder*="subscribe" i]',
+            'input[aria-label*="subscribe" i]',
+            'input[class*="subscribe" i]'
+        ];
+        const firstNameSelectors = [
+            'input[name*="first" i], input[name*="fname" i], input[id*="first" i], input[id*="fname" i]',
+            'input[placeholder*="first" i], input[autocomplete="given-name"]',
+            'input[data-testid*="first" i], input[data-cy*="first" i]',
+            'input[name*="given" i], input[id*="given" i]'
+        ];
+        const lastNameSelectors = [
+            'input[name*="last" i], input[name*="lname" i], input[id*="last" i], input[id*="lname" i]',
+            'input[placeholder*="last" i], input[autocomplete="family-name"]',
+            'input[data-testid*="last" i], input[data-cy*="last" i]',
+            'input[name*="family" i], input[id*="family" i]'
+        ];
+        const phoneSelectors = [
+            'input[type="tel"]', 'input[name*="phone" i], input[id*="phone" i], input[placeholder*="phone" i]',
+            'input[autocomplete="tel"]', 'input[data-testid*="phone" i]',
+            'input[type="text"][name*="phone" i]'
+        ];
+        const zipSelectors = [
+            'input[name*="zip" i], input[name*="postal" i], input[id*="zip" i], input[id*="postal" i]',
+            'input[placeholder*="zip" i], input[autocomplete="postal-code"]',
+            'input[data-testid*="zip" i]',
+            'input[type="text"][name*="zip" i], input[type="text"][name*="postal" i]'
+        ];
+        const messageSelectors = [
+            'textarea[name*="message" i], textarea[id*="message" i], textarea[placeholder*="message" i]',
+            'textarea[data-testid*="message" i]'
+        ];
+        const jobTitleSelectors = [
+            'input[name*="job" i], input[name*="title" i], input[name*="position" i], input[name*="role" i]',
+            'input[autocomplete="organization-title"]',
+            'input[id*="job" i], input[id*="title" i], input[id*="position" i], input[id*="role" i]',
+            'input[placeholder*="job title" i], input[placeholder*="position" i], input[placeholder*="role" i]',
+            'input[data-testid*="job" i], input[data-testid*="title" i], input[data-testid*="position" i]'
+        ];
+        const companySelectors = [
+            'input[name*="company" i], input[name*="organization" i], input[name*="org" i]',
+            'input[autocomplete="organization"]',
+            'input[id*="company" i], input[id*="organization" i], input[id*="org" i]',
+            'input[placeholder*="company" i], input[placeholder*="organization" i]',
+            'input[data-testid*="company" i], input[data-testid*="organization" i]'
+        ];
+        const websiteSelectors = [
+            'input[name*="website" i], input[name*="url" i], input[name*="web" i]',
+            'input[type="url"]',
+            'input[id*="website" i], input[id*="url" i], input[id*="web" i]',
+            'input[placeholder*="website" i], input[placeholder*="url" i]',
+            'input[data-testid*="website" i], input[data-testid*="url" i]'
+        ];
+
+        const emailField = findField(emailSelectors, context);
+
+        if (emailField) {
+            form = emailField.closest('form') || context.body;
+            const shouldFillNameFields = checkRequiredFields(form, data);
+            scrollToElement(emailField);
+
+            setTimeout(() => {
+                emailField.value = data.email;
+                dispatchInputEvents(emailField);
+
+                // v4.1: Use original logic for required name fields, plus full name detection
+                if (shouldFillNameFields) {
+                    const firstNameField = findField(firstNameSelectors, context);
+                    if (firstNameField && data.firstName) { firstNameField.value = data.firstName; dispatchInputEvents(firstNameField); }
+                    const lastNameField = findField(lastNameSelectors, context);
+                    if (lastNameField && data.lastName) { lastNameField.value = data.lastName; dispatchInputEvents(lastNameField); }
+                } else {
+                    // Even if not required, try full name field detection
+                    fillNameFields(context, data, emailField);
+                }
+
+                const phoneField = findField(phoneSelectors, context);
+                if (phoneField && data.phone && !isHiddenHoneypot(phoneField)) { phoneField.value = data.phone; dispatchInputEvents(phoneField); }
+
+                const zipField = findField(zipSelectors, context);
+                if (zipField && data.zipCode && !isHiddenHoneypot(zipField)) { zipField.value = data.zipCode; dispatchInputEvents(zipField); }
+
+                const messageField = findField(messageSelectors, context);
+                if (messageField && data.customMessage && !isHiddenHoneypot(messageField)) { messageField.value = data.customMessage; dispatchInputEvents(messageField); }
+
+                const jobTitleField = findField(jobTitleSelectors, context);
+                if (jobTitleField && data.jobTitle && !isHiddenHoneypot(jobTitleField)) { jobTitleField.value = data.jobTitle; dispatchInputEvents(jobTitleField); }
+
+                const companyField = findField(companySelectors, context);
+                if (companyField && data.companyName && !isHiddenHoneypot(companyField)) { companyField.value = data.companyName; dispatchInputEvents(companyField); }
+
+                const websiteField = findField(websiteSelectors, context);
+                if (websiteField && data.websiteUrl && !isHiddenHoneypot(websiteField)) { websiteField.value = data.websiteUrl; dispatchInputEvents(websiteField); }
+
+                const checkedCount = checkConsentCheckboxes(context);
+                if (checkedCount > 0) console.log(`Checked ${checkedCount} consent checkbox(es)`);
+
+                setTimeout(() => {
+                    const submitButton = findSubmitButton(form, emailField, context);
+                    if (submitButton) {
+                        const buttonRect = submitButton.getBoundingClientRect();
+                        if (buttonRect.top < 0 || buttonRect.bottom > window.innerHeight) {
+                            scrollToElement(submitButton);
+                            setTimeout(() => submitForm(submitButton, form, emailField, context), 500);
+                        } else {
+                            submitForm(submitButton, form, emailField, context);
+                        }
+                    } else if (form && form.tagName === 'FORM') {
+                        try {
+                            form.submit();
+                            chrome.runtime.sendMessage({ action: "SCRIPT_COMPLETE", status: 'success', message: isPopup ? 'Popup form submitted successfully.' : 'Form submitted successfully.' });
+                        } catch (e) {
+                            chrome.runtime.sendMessage({ action: "SCRIPT_COMPLETE", status: 'error', message: `Error submitting form: ${e.message}` });
+                        }
+                    } else {
+                        const message = isPopup ? 'No submit button found in popup.' : 'No submit button found.';
+                        if (isPopup) { setTimeout(() => processMainPage(), 1000); }
+                        else { chrome.runtime.sendMessage({ action: "SCRIPT_COMPLETE", status: 'error', message }); }
+                    }
+                }, 3000);
+            }, 1500);
+
+        } else {
+            const message = isPopup ? 'No form or email field found in popup.' : 'No form or email field found.';
+            console.log(message);
+            if (isPopup) { setTimeout(() => processMainPage(), 1000); }
+            else { chrome.runtime.sendMessage({ action: "SCRIPT_COMPLETE", status: 'error', message }); }
+        }
+    }
+
+    function processMainPage() {
+        if (checkForPopupOverlays()) {
+            console.log('Popup overlay detected, attempting to bypass...');
+            tryBypassPopupOverlays();
+            setTimeout(() => processForm(document, false), 2000);
+        } else {
+            processForm(document, false);
+        }
+    }
+
+    // --- MAIN LOGIC ---
+    chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+        if (request.action === "AUTOFILL_FORM") {
+            window.autoFillData = request.data;
+            const enableScrolling = request.enableScrolling !== false;
+
+            function startProcessing() {
+                waitForPopup((popup) => {
+                    if (popup) {
+                        console.log('Processing popup form');
+                        processForm(popup, true);
+                    } else {
+                        console.log('No popup detected, processing main page');
+                        if (checkForPopupOverlays()) {
+                            console.log('Popup overlay detected, attempting to bypass...');
+                            tryBypassPopupOverlays();
+                            setTimeout(() => processForm(document, false), 2000);
+                        } else {
+                            processForm(document, false);
+                        }
+                    }
+                }, 3000);
+            }
+
+            startProcessing();
+        }
+    });
+})();
+
+popup.css :
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap');
+
+body {
+    font-family: 'Inter', sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+    color: #333;
+    background-color: #f8f9fa;
+    margin: 0;
+    padding: 0;
+}
+
+.container {
+    width: 420px;
+    max-height: 600px;
+    overflow-y: auto;
+}
+
+.header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 15px;
+    padding-bottom: 10px;
+    padding: 12px 15px;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    color: white;
+}
+
+h1 {
+    font-size: 20px;
+    font-weight: 600;
+    color: white;
+    margin: 0;
+}
+
+.version {
+    font-size: 11px;
+    font-weight: 400;
+    opacity: 0.7;
+}
+
+.status-indicator {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background-color: #28a745;
+    box-shadow: 0 0 6px rgba(40, 167, 69, 0.6);
+    transition: background-color 0.3s, box-shadow 0.3s;
+}
+
+.status-indicator.running {
+    background-color: #ffc107;
+    box-shadow: 0 0 6px rgba(255, 193, 7, 0.6);
+    animation: pulse 1.5s ease-in-out infinite;
+}
+
+.status-indicator.paused {
+    background-color: #fd7e14;
+    box-shadow: 0 0 6px rgba(253, 126, 20, 0.6);
+}
+
+.status-indicator.stopped {
+    background-color: #dc3545;
+    box-shadow: 0 0 6px rgba(220, 53, 69, 0.6);
+}
+
+.status-indicator.completed {
+    background-color: #28a745;
+    box-shadow: 0 0 8px rgba(40, 167, 69, 0.8);
+}
+
+@keyframes pulse {
+    0% { opacity: 1; }
+    50% { opacity: 0.4; }
+    100% { opacity: 1; }
+}
+
+.content {
+    padding: 0 15px;
+}
+
+.section {
+    margin-bottom: 20px;
+}
+
+h2 {
+    font-size: 14px;
+    font-weight: 600;
+    color: #2c3e50;
+    margin-bottom: 8px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.form-group {
+    margin-bottom: 10px;
+}
+
+.form-group label {
+    display: block;
+    font-size: 12px;
+    font-weight: 500;
+    color: #666;
+    margin-bottom: 3px;
+}
+
+.form-group input[type="text"],
+.form-group input[type="email"],
+.form-group input[type="tel"],
+.form-group input[type="url"],
+.form-group textarea {
+    width: 100%;
+    padding: 8px 10px;
+    border: 1px solid #ddd;
+    border-radius: 6px;
+    font-size: 13px;
+    font-family: 'Inter', sans-serif;
+    transition: border-color 0.2s, box-shadow 0.2s;
+    box-sizing: border-box;
+}
+
+.form-group input:focus,
+.form-group textarea:focus {
+    border-color: #667eea;
+    box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.15);
+    outline: none;
+}
+
+.form-row {
+    display: flex;
+    gap: 10px;
+}
+
+.form-group.half {
+    flex: 1;
+}
+
+.form-group.half input {
+    width: 100%;
+}
+
+.toggle-btn {
+    width: 100%;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: none;
+    border: 1px solid #ddd;
+    border-radius: 6px;
+    padding: 8px 12px;
+    font-size: 13px;
+    font-weight: 500;
+    color: #667eea;
+    cursor: pointer;
+    transition: background-color 0.2s;
+}
+
+.toggle-btn:hover {
+    background-color: #f0f2ff;
+}
+
+.toggle-btn .arrow {
+    font-size: 10px;
+    transition: transform 0.2s;
+}
+
+.toggle-btn.expanded .arrow {
+    transform: rotate(180deg);
+}
+
+.extra-fields {
+    margin-top: 10px;
+    padding-top: 5px;
+}
+
+.form-group textarea {
+    resize: vertical;
+    min-height: 44px;
+}
+
+.form-group small {
+    display: block;
+    font-size: 11px;
+    color: #999;
+    margin-top: 3px;
+}
+
+.form-group label:has(input[type="checkbox"]) {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    color: #555;
+    cursor: pointer;
+}
+
+.form-group input[type="checkbox"] {
+    accent-color: #667eea;
+}
+
+.controls {
+    display: flex;
+    gap: 6px;
+    margin-bottom: 15px;
+    flex-wrap: wrap;
+}
+
+.btn {
+    padding: 8px 14px;
+    border: none;
+    border-radius: 6px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s;
+    font-family: 'Inter', sans-serif;
+}
+
+.btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+.btn-start {
+    background: linear-gradient(135deg, #28a745, #20c997);
+    color: white;
+    flex: 1;
+}
+
+.btn-start:hover:not(:disabled) {
+    transform: translateY(-1px);
+    box-shadow: 0 2px 8px rgba(40, 167, 69, 0.3);
+}
+
+.btn-pause {
+    background: linear-gradient(135deg, #ffc107, #fd7e14);
+    color: white;
+}
+
+.btn-pause:hover:not(:disabled) {
+    transform: translateY(-1px);
+    box-shadow: 0 2px 8px rgba(255, 193, 7, 0.3);
+}
+
+.btn-resume {
+    background: linear-gradient(135deg, #667eea, #764ba2);
+    color: white;
+}
+
+.btn-resume:hover:not(:disabled) {
+    transform: translateY(-1px);
+    box-shadow: 0 2px 8px rgba(102, 126, 234, 0.3);
+}
+
+.btn-stop {
+    background: linear-gradient(135deg, #dc3545, #c82333);
+    color: white;
+}
+
+.btn-stop:hover:not(:disabled) {
+    transform: translateY(-1px);
+    box-shadow: 0 2px 8px rgba(220, 53, 69, 0.3);
+}
+
+.btn-clear {
+    background: #f8f9fa;
+    color: #666;
+    border: 1px solid #ddd;
+}
+
+.btn-clear:hover:not(:disabled) {
+    background: #e9ecef;
+}
+
+.btn-info {
+    background: linear-gradient(135deg, #667eea, #764ba2);
+    color: white;
+    width: 100%;
+}
+
+.btn-info:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 2px 8px rgba(102, 126, 234, 0.3);
+}
+
+.progress-container {
+    margin-bottom: 15px;
+}
+
+.progress-container label {
+    font-size: 12px;
+    color: #666;
+    margin-bottom: 4px;
+    display: block;
+}
+
+#progress-bar {
+    width: 100%;
+    height: 8px;
+    border-radius: 4px;
+    appearance: none;
+    -webkit-appearance: none;
+    overflow: hidden;
+}
+
+#progress-bar::-webkit-progress-bar {
+    background: #e9ecef;
+    border-radius: 4px;
+}
+
+#progress-bar::-webkit-progress-value {
+    background: linear-gradient(135deg, #667eea, #764ba2);
+    border-radius: 4px;
+    transition: width 0.3s ease;
+}
+
+input[type="range"] {
+    width: 100%;
+    accent-color: #667eea;
+}
+
+#log-container {
+    max-height: 180px;
+    overflow-y: auto;
+    background: #fff;
+    border: 1px solid #e9ecef;
+    border-radius: 8px;
+    padding: 8px;
+    font-size: 11px;
+    line-height: 1.6;
+}
+
+#log-container::-webkit-scrollbar {
+    width: 5px;
+}
+
+#log-container::-webkit-scrollbar-thumb {
+    background: #ccc;
+    border-radius: 3px;
+}
+
+.log-entry {
+    padding: 3px 0;
+    border-bottom: 1px solid #f5f5f5;
+    display: flex;
+    gap: 6px;
+}
+
+.log-entry:last-child {
+    border-bottom: none;
+}
+
+.log-entry .timestamp {
+    color: #999;
+    font-size: 10px;
+    white-space: nowrap;
+}
+
+.log-entry .message {
+    flex: 1;
+    word-break: break-word;
+}
+
+.log-entry.info .message { color: #333; }
+.log-entry.success .message { color: #28a745; }
+.log-entry.warning .message { color: #ffc107; }
+.log-entry.error .message { color: #dc3545; }
+
+#site-list {
+    width: 100%;
+    padding: 8px 10px;
+    border: 1px solid #ddd;
+    border-radius: 6px;
+    font-size: 13px;
+    font-family: 'Inter', sans-serif;
+    resize: vertical;
+    min-height: 70px;
+    box-sizing: border-box;
+}
+
+#site-list:focus {
+    border-color: #667eea;
+    box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.15);
+    outline: none;
+}
+
+popup.html :
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Auto-Fill Pro Control Panel</title>
+    <link rel="stylesheet" href="popup.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Auto-Fill Pro <span class="version">v4.0</span></h1>
+            <div class="status-indicator" id="status-indicator"></div>
+        </div>
+        <div class="content">
+            <div class="section">
+                <h2>User Data</h2>
+                <form id="credentials-form">
+                    <div class="form-group">
+                        <label for="email">Email *</label>
+                        <input type="email" id="email" placeholder="you@example.com" required>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group half">
+                            <label for="firstName">First Name</label>
+                            <input type="text" id="firstName" placeholder="John">
+                        </div>
+                        <div class="form-group half">
+                            <label for="lastName">Last Name</label>
+                            <input type="text" id="lastName" placeholder="Doe">
+                        </div>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group half">
+                            <label for="phone">Phone</label>
+                            <input type="tel" id="phone" placeholder="123-456-7890">
+                        </div>
+                        <div class="form-group half">
+                            <label for="zipCode">Zip Code</label>
+                            <input type="text" id="zipCode" placeholder="90210">
+                        </div>
+                    </div>
+                    <div class="form-group collapsible">
+                        <button type="button" class="toggle-btn" id="toggle-extra-fields">
+                            <span>Additional Fields</span>
+                            <span class="arrow">&#9660;</span>
+                        </button>
+                        <div class="extra-fields" id="extra-fields" style="display:none;">
+                            <div class="form-group">
+                                <label for="jobTitle">Job Title</label>
+                                <input type="text" id="jobTitle" placeholder="Software Engineer">
+                            </div>
+                            <div class="form-group">
+                                <label for="companyName">Company Name</label>
+                                <input type="text" id="companyName" placeholder="Acme Inc.">
+                            </div>
+                            <div class="form-group">
+                                <label for="websiteUrl">Website URL</label>
+                                <input type="url" id="websiteUrl" placeholder="https://example.com">
+                            </div>
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label for="customMessage">Custom Message</label>
+                        <textarea id="customMessage" rows="2" placeholder="Optional message..."></textarea>
+                    </div>
+                    <button type="button" id="saveInfoBtn" class="btn btn-info">Save Info</button>
+                </form>
+            </div>
+            <div class="section">
+                <h2>Sites to Process</h2>
+                <textarea id="site-list" rows="4" placeholder="example.com&#10;another-site.org/newsletter&#10;onemore.co"></textarea>
+            </div>
+            <div class="controls">
+                <button id="startBtn" class="btn btn-start">Start</button>
+                <button id="pauseBtn" class="btn btn-pause" disabled>Pause</button>
+                <button id="resumeBtn" class="btn btn-resume" disabled>Resume</button>
+                <button id="stopBtn" class="btn btn-stop" disabled>Stop</button>
+                <button id="clearBtn" class="btn btn-clear">Clear</button>
+            </div>
+            <div class="progress-container">
+                <label for="progress-bar">Progress: <span id="progress-text">0/0</span></label>
+                <progress id="progress-bar" value="0" max="0"></progress>
+            </div>
+            <div class="section">
+                <h2>Settings</h2>
+                <div class="form-group">
+                    <label for="timeout-slider">Site Timeout: <span id="timeout-value">15</span>s</label>
+                    <input type="range" id="timeout-slider" min="5" max="30" value="15" step="1">
+                    <small>Time to wait before skipping to the next site</small>
+                </div>
+                <div class="form-group">
+                    <label>
+                        <input type="checkbox" id="scroll-checkbox" checked>
+                        Enable thorough scrolling to verify forms
+                    </label>
+                </div>
+            </div>
+            <div class="section">
+                <h2>Activity Log</h2>
+                <div id="log-container"></div>
+            </div>
+        </div>
+    </div>
+    <script src="popup.js"></script>
+</body>
+</html>
+
+popup.js :
+
+// popup.js - v4.0
+document.addEventListener('DOMContentLoaded', () => {
+    const emailInput = document.getElementById('email');
+    const firstNameInput = document.getElementById('firstName');
+    const lastNameInput = document.getElementById('lastName');
+    const phoneInput = document.getElementById('phone');
+    const zipCodeInput = document.getElementById('zipCode');
+    const customMessageInput = document.getElementById('customMessage');
+    const jobTitleInput = document.getElementById('jobTitle');
+    const companyNameInput = document.getElementById('companyName');
+    const websiteUrlInput = document.getElementById('websiteUrl');
+    const siteList = document.getElementById('site-list');
+    const saveInfoBtn = document.getElementById('saveInfoBtn');
+    const startBtn = document.getElementById('startBtn');
+    const pauseBtn = document.getElementById('pauseBtn');
+    const resumeBtn = document.getElementById('resumeBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const clearBtn = document.getElementById('clearBtn');
+    const progressBar = document.getElementById('progress-bar');
+    const progressText = document.getElementById('progress-text');
+    const logContainer = document.getElementById('log-container');
+    const statusIndicator = document.getElementById('status-indicator');
+    const timeoutSlider = document.getElementById('timeout-slider');
+    const timeoutValue = document.getElementById('timeout-value');
+    const scrollCheckbox = document.getElementById('scroll-checkbox');
+    const toggleExtraFields = document.getElementById('toggle-extra-fields');
+    const extraFields = document.getElementById('extra-fields');
+
+    toggleExtraFields.addEventListener('click', () => {
+        const isExpanded = extraFields.style.display !== 'none';
+        extraFields.style.display = isExpanded ? 'none' : 'block';
+        toggleExtraFields.classList.toggle('expanded', !isExpanded);
+    });
+
+    saveInfoBtn.addEventListener('click', () => {
+        const data = {
+            email: emailInput.value.trim(),
+            firstName: firstNameInput.value.trim(),
+            lastName: lastNameInput.value.trim(),
+            phone: phoneInput.value.trim(),
+            zipCode: zipCodeInput.value.trim(),
+            customMessage: customMessageInput.value.trim(),
+            jobTitle: jobTitleInput.value.trim(),
+            companyName: companyNameInput.value.trim(),
+            websiteUrl: websiteUrlInput.value.trim(),
+        };
+        chrome.runtime.sendMessage({ action: "SAVE_CREDENTIALS", data }, (response) => {
+            if (response && response.success) {
+                saveInfoBtn.textContent = 'Saved!';
+                saveInfoBtn.style.background = 'linear-gradient(135deg, #28a745, #20c997)';
+                setTimeout(() => {
+                    saveInfoBtn.textContent = 'Save Info';
+                    saveInfoBtn.style.background = '';
+                }, 1500);
+            }
+        });
+    });
+
+    startBtn.addEventListener('click', () => {
+        const email = emailInput.value.trim();
+        if (!email) {
+            emailInput.style.borderColor = '#dc3545';
+            emailInput.focus();
+            setTimeout(() => { emailInput.style.borderColor = ''; }, 2000);
+            return;
+        }
+        const sites = siteList.value.split('\n').map(url => url.trim()).filter(url => url.length > 0);
+        if (sites.length === 0) {
+            siteList.style.borderColor = '#dc3545';
+            siteList.focus();
+            setTimeout(() => { siteList.style.borderColor = ''; }, 2000);
+            return;
+        }
+        const data = {
+            email: email,
+            firstName: firstNameInput.value.trim(),
+            lastName: lastNameInput.value.trim(),
+            phone: phoneInput.value.trim(),
+            zipCode: zipCodeInput.value.trim(),
+            customMessage: customMessageInput.value.trim(),
+            jobTitle: jobTitleInput.value.trim(),
+            companyName: companyNameInput.value.trim(),
+            websiteUrl: websiteUrlInput.value.trim(),
+        };
+        chrome.runtime.sendMessage({
+            action: "START_PROCESSING",
+            sites,
+            data,
+            enableScrolling: scrollCheckbox.checked
+        }, (response) => {
+            if (response && response.success) updateButtonStates('running');
+            else if (response && response.error) alert(response.error);
+        });
+    });
+
+    pauseBtn.addEventListener('click', () => {
+        chrome.runtime.sendMessage({ action: "PAUSE_PROCESSING" }, (response) => {
+            if (response && response.success) updateButtonStates('paused');
+        });
+    });
+
+    resumeBtn.addEventListener('click', () => {
+        chrome.runtime.sendMessage({ action: "RESUME_PROCESSING" }, (response) => {
+            if (response && response.success) updateButtonStates('running');
+        });
+    });
+
+    stopBtn.addEventListener('click', () => {
+        if (confirm('Are you sure you want to stop processing?')) {
+            chrome.runtime.sendMessage({ action: "STOP_PROCESSING" }, (response) => {
+                if (response && response.success) updateButtonStates('stopped');
+            });
+        }
+    });
+
+    clearBtn.addEventListener('click', () => {
+        if (confirm('Clear all data and reset?')) {
+            chrome.runtime.sendMessage({ action: "CLEAR_STATE" }, (response) => {
+                if (response && response.success) {
+                    emailInput.value = '';
+                    firstNameInput.value = '';
+                    lastNameInput.value = '';
+                    phoneInput.value = '';
+                    zipCodeInput.value = '';
+                    customMessageInput.value = '';
+                    jobTitleInput.value = '';
+                    companyNameInput.value = '';
+                    websiteUrlInput.value = '';
+                    siteList.value = '';
+                    logContainer.innerHTML = '';
+                    progressBar.value = 0;
+                    progressBar.max = 0;
+                    progressText.textContent = '0/0';
+                    updateButtonStates('idle');
+                }
+            });
+        }
+    });
+
+    timeoutSlider.addEventListener('input', () => {
+        const value = parseInt(timeoutSlider.value);
+        timeoutValue.textContent = value;
+        chrome.runtime.sendMessage({ action: "UPDATE_TIMEOUT", timeout: value * 1000 });
+    });
+
+    scrollCheckbox.addEventListener('change', () => {
+        chrome.runtime.sendMessage({ action: "UPDATE_SCROLL_SETTING", enableScrolling: scrollCheckbox.checked });
+    });
+
+    function updateButtonStates(status) {
+        startBtn.disabled = status === 'running' || status === 'paused';
+        pauseBtn.disabled = status !== 'running';
+        resumeBtn.disabled = status !== 'paused';
+        stopBtn.disabled = status === 'idle' || status === 'stopped';
+        statusIndicator.className = 'status-indicator';
+        if (status === 'running') statusIndicator.classList.add('running');
+        else if (status === 'paused') statusIndicator.classList.add('paused');
+        else if (status === 'stopped') statusIndicator.classList.add('stopped');
+        else if (status === 'completed') statusIndicator.classList.add('completed');
+    }
+
+    function updateUI(state) {
+        if (state.sites && state.sites.length > 0) {
+            progressBar.max = state.sites.length;
+            progressBar.value = state.currentIndex || 0;
+            progressText.textContent = `${state.currentIndex || 0}/${state.sites.length}`;
+        } else {
+            progressBar.max = 0;
+            progressBar.value = 0;
+            progressText.textContent = '0/0';
+        }
+        updateButtonStates(state.status);
+        renderLog(state.log);
+        if (state.userCredentials) {
+            if (state.userCredentials.email && !emailInput.value) emailInput.value = state.userCredentials.email;
+            if (state.userCredentials.firstName && !firstNameInput.value) firstNameInput.value = state.userCredentials.firstName;
+            if (state.userCredentials.lastName && !lastNameInput.value) lastNameInput.value = state.userCredentials.lastName;
+            if (state.userCredentials.phone && !phoneInput.value) phoneInput.value = state.userCredentials.phone;
+            if (state.userCredentials.zipCode && !zipCodeInput.value) zipCodeInput.value = state.userCredentials.zipCode;
+            if (state.userCredentials.customMessage && !customMessageInput.value) customMessageInput.value = state.userCredentials.customMessage;
+            if (state.userCredentials.jobTitle && !jobTitleInput.value) jobTitleInput.value = state.userCredentials.jobTitle;
+            if (state.userCredentials.companyName && !companyNameInput.value) companyNameInput.value = state.userCredentials.companyName;
+            if (state.userCredentials.websiteUrl && !websiteUrlInput.value) websiteUrlInput.value = state.userCredentials.websiteUrl;
+        }
+        if (state.siteTimeout) {
+            const seconds = Math.round(state.siteTimeout / 1000);
+            timeoutSlider.value = seconds;
+            timeoutValue.textContent = seconds;
+        }
+        if (state.enableScrolling !== undefined) scrollCheckbox.checked = state.enableScrolling;
+    }
+
+    function renderLog(log) {
+        if (!log || log.length === 0) {
+            logContainer.innerHTML = '<div style="color:#999;text-align:center;padding:10px;">No activity yet</div>';
+            return;
+        }
+        logContainer.innerHTML = log.map(entry => `
+            <div class="log-entry ${entry.type || 'info'}">
+                <span class="timestamp">${entry.timestamp || ''}</span>
+                <span class="message">${escapeHtml(entry.message || '')}</span>
+            </div>
+        `).join('');
+        logContainer.scrollTop = 0;
+    }
+
+    function escapeHtml(text) {
+        const div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
+    }
+
+    chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+        if (request.action === "UPDATE_UI") updateUI(request.payload);
+    });
+
+    chrome.runtime.sendMessage({ action: "GET_STATE" }, (state) => {
+        if (state) updateUI(state);
+    });
+});
