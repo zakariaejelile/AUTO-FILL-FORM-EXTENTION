@@ -22,8 +22,6 @@ A Chrome extension  that walks through a list of websites, opens each one in a b
 - [Permissions and privacy](#permissions-and-privacy)
 - [Known limitations](#known-limitations)
 - [Troubleshooting](#troubleshooting)
-- [Version notes](#version-notes)
-- [License](#license)
 
 ---
 
